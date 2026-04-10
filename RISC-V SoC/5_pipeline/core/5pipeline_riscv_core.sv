@@ -8,24 +8,23 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
   output logic [XLEN-1:0]  pc_out
 );
 
-  // ==========================================================================
+  //  Internal Signals
   //  Hazard & Flush Control
-  // ==========================================================================
   logic stall;        // Load-use hazard stall (from hazard_detection)
   logic ex_redirect;  // Branch/jump taken in EX stage
 
-  // ==========================================================================
+  
   //  IF Stage Signals
-  // ==========================================================================
+  
   logic [XLEN-1:0] pc, next_pc, next_seq_pc;
   logic            imem_req;
   logic [XLEN-1:0] imem_addr;
   logic [31:0]     imem_data;
   logic [31:0]     instruction;
 
-  // ==========================================================================
+  
   //  ID Stage Signals (Decode + Control + Register File)
-  // ==========================================================================
+  
   logic [6:0]      opcode;
   logic [2:0]      funct3;
   logic [6:0]      funct7;
@@ -46,9 +45,9 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
   // WB-to-ID bypass (same-cycle register write + read)
   logic [XLEN-1:0] rs1_data_bypassed, rs2_data_bypassed;
 
-  // ==========================================================================
+  
   //  EX Stage Signals
-  // ==========================================================================
+  
   logic [XLEN-1:0] alu_a, alu_b, alu_res;
   logic [XLEN-1:0] fwd_rs1_data, fwd_rs2_data;  // Forwarded operands
   logic [1:0]      fwd_a_sel, fwd_b_sel;         // Forwarding mux selects
@@ -57,19 +56,17 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
   logic            ex_branch_taken;              // Branch decision in EX
   logic [XLEN-1:0] ex_redirect_target;           // Branch/jump target
 
-  // ==========================================================================
+  
   //  MEM Stage Signals
-  // ==========================================================================
+  
   logic [XLEN-1:0] dmem_rd_data;
 
-  // ==========================================================================
+  
   //  WB Stage Signals
-  // ==========================================================================
+  
   logic [XLEN-1:0] wr_data;
 
-  // ==========================================================================
   //  Pipeline Registers
-  // ==========================================================================
 
   // IF/ID
   logic [31:0]     if_id_pc;
@@ -122,9 +119,9 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
   logic [XLEN-1:0] mem_wb_pc_plus_4;
   logic [XLEN-1:0] mem_wb_immediate;
 
-  // ==========================================================================
+  
   //  IF Stage
-  // ==========================================================================
+  
 
   // PC Register
   always_ff @(posedge clk or negedge reset_n) begin
@@ -172,9 +169,9 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     // On stall: hold current values
   end
 
-  // ==========================================================================
+  
   //  ID Stage
-  // ==========================================================================
+  
 
   // Decode
   decode u_decode (
@@ -316,9 +313,9 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     end
   end
 
-  // ==========================================================================
+  
   //  EX Stage
-  // ==========================================================================
+  
 
   // Forwarding Unit
   forwarding_unit u_forwarding_unit (
@@ -417,9 +414,9 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     end
   end
 
-  // ==========================================================================
+  
   //  MEM Stage
-  // ==========================================================================
+  
 
   data_memory u_data_memory (
     .clk              (clk),
@@ -453,9 +450,9 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     end
   end
 
-  // ==========================================================================
+  
   //  WB Stage
-  // ==========================================================================
+  
 
   always_comb begin
     case (mem_wb_rf_wr_data_sel)
