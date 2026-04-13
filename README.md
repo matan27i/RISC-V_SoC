@@ -42,7 +42,7 @@
 - [x] 5-Stage Pipeline Core.
 - [x] Forwarding & Hazard Detection.
 - [x] Dynamic Branch Prediction (BRAM based).
-- [x] L1 Instruction Cache.
+- [ ] L1 Instruction Cache.
 - [ ] L1 Data Cache.
 - [ ] AXI4-Lite Bus Interface.
 - [ ] DFT (Design for Test) - SCAN & BIST insertion.
