@@ -34,9 +34,8 @@
 
 ## 🔧 Tools
 - **Language:** SystemVerilog
-- **Simulation:** Icarus Verilog / Vivado Simulator
-- **Waveform Analysis:** Questa
-- **Synthesis/Implementation:** Xilinx Vivado (Targeting FPGA BRAMs and LUTs)
+- **Simulation:** Questa / Icarus Verilog / Vivado Simulator
+- **Synthesis/Implementation:** Precision Synthesis / Xilinx Vivado (Targeting FPGA BRAMs and LUTs)
 
 ## 🗺️ Roadmap
 - [x] 5-Stage Pipeline Core.
