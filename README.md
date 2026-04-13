@@ -5,7 +5,7 @@
 ## Key Specifications
 - **ISA:** RISC-V RV32I (Base Integer Instruction Set).
 - **Pipeline:** 5-Stage (Fetch, Decode, Execute, Memory, Write-Back).
-- 
+  
 ## 🛠️ Microarchitectural Features
 
 ### 1. Dynamic Branch Prediction (BTB)
