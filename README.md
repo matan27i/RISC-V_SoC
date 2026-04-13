@@ -2,7 +2,7 @@
 
 **UltraCore-V** is a high-performance, 32-bit RISC-V soft-core processor designed from scratch in SystemVerilog. It features a robust 5-stage pipeline and is architected specifically for FPGA efficiency, incorporating advanced microarchitectural features like dynamic branch prediction and an L1 instruction cache.
 
-## 🚀 Key Specifications
+## Key Specifications
 - **ISA:** RISC-V RV32I (Base Integer Instruction Set).
 - **Pipeline:** 5-Stage (Fetch, Decode, Execute, Memory, Write-Back).
 - 
