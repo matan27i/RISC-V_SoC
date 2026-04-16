@@ -10,16 +10,40 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
 
   //  Internal Signals
   //  Hazard & Flush Control
-  logic stall;        // Load-use hazard stall (from hazard_detection)
-  logic ex_redirect;  // Branch/jump taken in EX stage
+  logic hazard_stall;       // Load-use hazard stall (from hazard_detection)
+  logic icache_stall;       // I-Cache miss stall
+  logic dcache_stall;       // D-Cache miss stall
+  logic pipeline_stall;     // Composite: any source of pipeline stall
+  logic ex_redirect;        // Branch/jump taken in EX stage
+  logic effective_redirect; // Redirect gated by cache stalls
+
+  assign pipeline_stall     = hazard_stall | icache_stall | dcache_stall;
+  assign effective_redirect = ex_redirect & ~icache_stall & ~dcache_stall;
 
   
   //  IF Stage Signals
   logic [XLEN-1:0] pc, next_pc, next_seq_pc;
-  logic            imem_req;
-  logic [XLEN-1:0] imem_addr;
-  logic [31:0]     imem_data;
   logic [31:0]     instruction;
+  logic            icache_ready;
+
+  //  Cache ↔ Main Memory interface (I-Cache)
+  logic             ic_mem_req;
+  logic [XLEN-1:0]  ic_mem_addr;
+  logic [31:0]      ic_mem_data;
+  logic             ic_mem_data_valid;
+  logic             ic_mem_ready;
+
+  //  Cache ↔ Main Memory interface (D-Cache)
+  logic             dc_mem_req;
+  logic             dc_mem_wr_en;
+  logic [XLEN-1:0]  dc_mem_addr;
+  logic [31:0]      dc_mem_wr_data;
+  logic [31:0]      dc_mem_data;
+  logic             dc_mem_data_valid;
+  logic             dc_mem_ready;
+
+  //  D-Cache ready handshake
+  logic             dcache_ready;
 
   
   //  ID Stage Signals (Decode + Control + Register File)
@@ -142,11 +166,11 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
   //  IF Stage
   // BTB lookahead address: mirrors PC mux so BRAM output is pre-aligned
   always_comb begin
-    if (ex_redirect)
+    if (effective_redirect)
       btb_lookup_addr = ex_redirect_target;
-    else if (btb_predict_taken && !stall)
+    else if (btb_predict_taken && !pipeline_stall)
       btb_lookup_addr = btb_predict_target;
-    else if (!stall)
+    else if (!pipeline_stall)
       btb_lookup_addr = next_seq_pc;
     else
       btb_lookup_addr = pc;             // Stall — re-read same entry
@@ -157,36 +181,35 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     if (!reset_n)
       pc <= RESET_PC;
 
-    else if (ex_redirect)
+    else if (effective_redirect)
       pc <= ex_redirect_target;         // Highest: misprediction correction
 
-    else if (btb_predict_taken && !stall)
+    else if (btb_predict_taken && !pipeline_stall)
       pc <= btb_predict_target;         // BTB speculative redirect
 
-    else if (!stall)
+    else if (!pipeline_stall)
       pc <= next_seq_pc;                // Sequential PC+4
   end
 
   assign next_seq_pc = pc + 32'h4;
   assign pc_out      = pc;
 
-  // Instruction Memory
-  instruction_memory u_instruction_memory (
-    .imem_req  (imem_req),
-    .imem_addr (imem_addr),
-    .imem_data (imem_data)
+  // L1 Instruction Cache — direct-mapped, BRAM-based, lookahead addressing
+  l1_icache u_l1_icache (
+    .clk             (clk),
+    .reset_n         (reset_n),
+    .cpu_req         (reset_n),
+    .cpu_addr        (btb_lookup_addr),     // Lookahead address (aligned with current PC)
+    .cpu_data        (instruction),
+    .cpu_ready       (icache_ready),
+    .mem_req         (ic_mem_req),
+    .mem_addr        (ic_mem_addr),
+    .mem_data        (ic_mem_data),
+    .mem_data_valid  (ic_mem_data_valid),
+    .mem_ready       (ic_mem_ready)
   );
 
-  // Fetch
-  fetch u_fetch (
-    .clk         (clk),
-    .reset_n     (reset_n),
-    .pc          (pc),
-    .imem_data   (imem_data),
-    .imem_req    (imem_req),
-    .imem_addr   (imem_addr),
-    .instruction (instruction)
-  );
+  assign icache_stall = ~icache_ready;
 
   // Branch Target Buffer (BTB) — BRAM, 1-cycle read latency
   btb u_btb (
@@ -210,19 +233,20 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
       if_id_btb_predict_target <= '0;
     end
 
-    else if (ex_redirect) begin
+    else if (effective_redirect) begin
       if_id_pc                 <= RESET_PC;
       if_id_instr              <= 32'h00000013; // NOP
       if_id_btb_predict_taken  <= 1'b0;
       if_id_btb_predict_target <= '0;
     end
 
-    else if (!stall) begin
+    else if (!pipeline_stall) begin
       if_id_pc                 <= pc;
       if_id_instr              <= instruction;
       if_id_btb_predict_taken  <= btb_predict_taken;
       if_id_btb_predict_target <= btb_predict_target;
     end
+    // else: cache stall — hold all IF/ID values
   end
 
   
@@ -294,7 +318,7 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     .rs2_addr              (rs2_addr),
     .id_ex_rf_wr_data_sel  (id_ex_rf_wr_data_sel),
     .id_ex_rd_addr         (id_ex_rd_addr),
-    .stall                 (stall)
+    .stall                 (hazard_stall)
   );
 
   // ID/EX Pipeline Register
@@ -323,7 +347,8 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
       id_ex_btb_predict_target <= '0;
     end 
     
-    else if (ex_redirect || stall) begin // Insert bubble
+    // Bubble: on effective redirect OR hazard-only stall (not cache stall)
+    else if (effective_redirect || (hazard_stall && !icache_stall && !dcache_stall)) begin
       id_ex_rf_wr_en           <= 1'b0;
       id_ex_rf_wr_data_sel     <= WB_SRC_ALU;
       id_ex_dmem_wr_en         <= 1'b0;
@@ -345,9 +370,10 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
       id_ex_rd_addr            <= 5'b0;
       id_ex_btb_predict_taken  <= 1'b0;
       id_ex_btb_predict_target <= '0;
-    end 
-    
-    else begin         //latch decoded control + data values
+    end
+
+    // Normal latch: only when no stall source active
+    else if (!pipeline_stall) begin
       id_ex_rf_wr_en           <= rf_wr_en;
       id_ex_rf_wr_data_sel     <= rf_wr_data_sel;
       id_ex_dmem_wr_en         <= dmem_wr_en;
@@ -370,6 +396,7 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
       id_ex_btb_predict_taken  <= if_id_btb_predict_taken;
       id_ex_btb_predict_target <= if_id_btb_predict_target;
     end
+    // else: cache stall — hold all ID/EX registers
   end
 
   
@@ -452,7 +479,7 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
   // PC+4 for JAL/JALR link register writeback (and not-taken correction target)
   assign ex_pc_plus_4 = id_ex_pc + 32'h4;
 
-  // EX/MEM Pipeline Register
+  // EX/MEM Pipeline Register — freeze on cache stall
   always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
       ex_mem_rf_wr_en         <= 1'b0;
@@ -466,9 +493,9 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
       ex_mem_rd_addr          <= 5'b0;
       ex_mem_pc_plus_4        <= '0;
       ex_mem_immediate        <= '0;
-    end 
-    
-    else begin
+    end
+
+    else if (!icache_stall && !dcache_stall) begin
       ex_mem_rf_wr_en         <= id_ex_rf_wr_en;
       ex_mem_rf_wr_data_sel   <= id_ex_rf_wr_data_sel;
       ex_mem_dmem_wr_en       <= id_ex_dmem_wr_en;
@@ -481,22 +508,54 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
       ex_mem_pc_plus_4        <= ex_pc_plus_4;
       ex_mem_immediate        <= id_ex_immediate;
     end
+    // else: cache stall — hold
   end
 
   
   //  MEM Stage
-  data_memory u_data_memory (
+  // L1 Data Cache — direct-mapped, BRAM-based, write-back policy
+  l1_dcache u_l1_dcache (
     .clk              (clk),
-    .dmem_req         (ex_mem_dmem_req),
-    .dmem_wr_en       (ex_mem_dmem_wr_en),
-    .dmem_data_size   (ex_mem_dmem_size),
-    .dmem_addr        (ex_mem_alu_res),
-    .dmem_wr_data     (ex_mem_rs2_data),
-    .dmem_zero_extend (ex_mem_dmem_zero_extend),
-    .dmem_rd_data     (dmem_rd_data)
+    .reset_n          (reset_n),
+    .cpu_req          (ex_mem_dmem_req),
+    .cpu_wr_en        (ex_mem_dmem_wr_en),
+    .cpu_data_size    (ex_mem_dmem_size),
+    .cpu_addr         (ex_mem_alu_res),
+    .cpu_wr_data      (ex_mem_rs2_data),
+    .cpu_zero_extend  (ex_mem_dmem_zero_extend),
+    .cpu_rd_data      (dmem_rd_data),
+    .cpu_ready        (dcache_ready),
+    .mem_req          (dc_mem_req),
+    .mem_wr_en        (dc_mem_wr_en),
+    .mem_addr         (dc_mem_addr),
+    .mem_wr_data      (dc_mem_wr_data),
+    .mem_data         (dc_mem_data),
+    .mem_data_valid   (dc_mem_data_valid),
+    .mem_ready        (dc_mem_ready)
   );
 
-  // MEM/WB Pipeline Register
+  // D-Cache stall: only when a valid memory request is outstanding and not ready
+  assign dcache_stall = ex_mem_dmem_req & ~dcache_ready;
+
+  // Main Memory Controller — unified backing store with arbiter
+  main_memory u_main_memory (
+    .clk                (clk),
+    .reset_n            (reset_n),
+    .icache_req         (ic_mem_req),
+    .icache_addr        (ic_mem_addr),
+    .icache_data        (ic_mem_data),
+    .icache_data_valid  (ic_mem_data_valid),
+    .icache_ready       (ic_mem_ready),
+    .dcache_req         (dc_mem_req),
+    .dcache_wr_en       (dc_mem_wr_en),
+    .dcache_addr        (dc_mem_addr),
+    .dcache_wr_data     (dc_mem_wr_data),
+    .dcache_data        (dc_mem_data),
+    .dcache_data_valid  (dc_mem_data_valid),
+    .dcache_ready       (dc_mem_ready)
+  );
+
+  // MEM/WB Pipeline Register — freeze on D-Cache stall
   always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
       mem_wb_rf_wr_en       <= 1'b0;
@@ -506,9 +565,9 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
       mem_wb_rd_addr        <= 5'b0;
       mem_wb_pc_plus_4      <= '0;
       mem_wb_immediate      <= '0;
-    end 
-    
-    else begin
+    end
+
+    else if (!dcache_stall) begin
       mem_wb_rf_wr_en       <= ex_mem_rf_wr_en;
       mem_wb_rf_wr_data_sel <= ex_mem_rf_wr_data_sel;
       mem_wb_alu_res        <= ex_mem_alu_res;
@@ -517,6 +576,7 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
       mem_wb_pc_plus_4      <= ex_mem_pc_plus_4;
       mem_wb_immediate      <= ex_mem_immediate;
     end
+    // else: D-cache stall — hold
   end
 
   

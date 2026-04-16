@@ -76,6 +76,13 @@ package risc_pkg;
     WB_SRC_PC  = 2'b11
   } wb_src_t;
 
+  typedef enum logic [1:0] {
+    CACHE_IDLE       = 2'b00,
+    CACHE_COMPARE    = 2'b01,
+    CACHE_ALLOCATE   = 2'b10,
+    CACHE_WRITE_BACK = 2'b11
+  } cache_state_t;
+
   typedef struct packed {
     logic      mem_valid;
     logic      mem_write;
