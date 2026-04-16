@@ -28,18 +28,14 @@
 ## 📂 Project Structure
 * `src/design/`: SystemVerilog RTL source files.
     * `5pipeline_riscv_core.sv`: Top-level core integration.
-    * `fetch.sv`, `decode.sv`, `alu.sv`, `branch_control.sv`, `control.sv`: Core execution datapath and control logic.
+    * `decode.sv`, `alu.sv`, `branch_control.sv`, `control.sv`: Core execution datapath and control logic.
     * `forwarding_unit.sv`, `hazard_detection.sv`: Hazard resolution units.
     * `register_file.sv`: 32x32-bit CPU registers.
     * `btb.sv`: Branch Target Buffer module.
     * `l1_icache.sv`, `l1_dcache.sv`: Level 1 Instruction and Data Caches.
-    * `main_memory.sv`, `instruction_memory.sv`, `data_memory.sv`: Memory controllers and backing storage.
+    * `main_memory.sv`: Memory controllers and backing storage.
 * `src/pkg/`: Global packages.
     * `risc_pkg.sv`: Global definitions, structs, and enumerations.
-* `src/sim/`: Testbenches and simulation scripts.
-* `src/synth/`: Synthesis constraints (XDC) and scripts for FPGA implementation.
-* `src/Software/`: Bare-metal C code and compiler scripts for SoC validation.
-* `src/PCB/`: Schematics and Board design files (Altium/KiCad).
 
 ## 🔧 Tools
 - **Language:** SystemVerilog, C
