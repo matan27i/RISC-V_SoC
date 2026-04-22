@@ -56,7 +56,14 @@ always_comb begin
         OPCODE_B_TYPE: b_type = 1'b1;
         OPCODE_LUI, OPCODE_AUIPC: u_type = 1'b1;
         OPCODE_JAL: j_type = 1'b1;
-        default: ;
+        default: begin
+            r_type = 1'b0;
+            i_type = 1'b0;
+            s_type = 1'b0;
+            b_type = 1'b0;
+            u_type = 1'b0;
+            j_type = 1'b0;
+        end
     endcase
 end
 

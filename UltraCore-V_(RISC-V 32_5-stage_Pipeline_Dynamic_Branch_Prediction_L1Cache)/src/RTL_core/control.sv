@@ -10,7 +10,7 @@ module control (
   input  logic       j_type,
 
   input  logic [2:0] funct3,
-  input  logic [6:0] funct7,
+  input  logic       funct7_bit5, // Distinguishes between certain instructions (e.g., SRLI vs SRAI)
   input  logic [6:0] opcode,
 
   output logic        pc_sel,
@@ -27,10 +27,10 @@ module control (
 
   logic [3:0] funct_r;
   logic [3:0] opcode_i;
-  logic       funct7_bit5;
+  
 
-  assign funct7_bit5 = funct7[5];
-  assign funct_r     = {funct7[5], funct3};
+ 
+  assign funct_r     = {funct7_bit5, funct3};
   assign opcode_i    = {opcode[4], funct3};
 
   control_t cntrl_r, cntrl_i, cntrl_s, cntrl_b, cntrl_u, cntrl_j, cntrl;
@@ -147,6 +147,8 @@ module control (
     else if (b_type) cntrl = cntrl_b;
     else if (u_type) cntrl = cntrl_u;
     else if (j_type) cntrl = cntrl_j;
+    
+    else             cntrl = '0;
   end
 
   assign pc_sel           = cntrl.pc_src_select;
@@ -159,5 +161,6 @@ module control (
   assign dmem_size        = cntrl.mem_size;
   assign dmem_zero_extend = cntrl.load_zero_extend;
   assign rf_wr_en         = cntrl.rf_write_enable;
+
 
 endmodule

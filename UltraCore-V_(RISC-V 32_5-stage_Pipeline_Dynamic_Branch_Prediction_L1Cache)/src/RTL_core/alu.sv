@@ -6,8 +6,8 @@ module alu(
   input  logic [XLEN-1:0] alu_b,    // ALU input B
   input  alu_op_t         alu_op,   // ALU operation from risc_pkg
 
-  output logic [XLEN-1:0] alu_res,  // ALU output
-  output logic            zero      // Zero flag for branch instructions
+  output logic [XLEN-1:0] alu_res // ALU output
+
 );
 
 // Internal signals for signed arithmetic operations

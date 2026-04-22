@@ -5,8 +5,8 @@
 import risc_pkg::*;
 
 module main_memory #(
-  parameter ADDR_WIDTH = 14,       // 16 KB backing store (byte-addressable)
-  parameter DATA_WIDTH = 8,        // Byte-addressable memory cells
+  parameter ADDR_WIDTH = 14,       // 16 KB backing store (byte-addressable at IF)
+  parameter DATA_WIDTH = 32,       // Word-wide storage (BRAM-friendly)
   parameter LATENCY    = 10,       // Cycles before first burst word
   parameter BURST_LEN  = 4         // Words per burst (= LINE_WORDS)
 )(
@@ -31,9 +31,15 @@ module main_memory #(
 );
 
   // ------------------------------------------------------------------
-  // Storage: Unified backing memory
+  // Storage: Unified backing memory (word-addressable, BRAM inferable)
+  // 2^ADDR_WIDTH bytes total => 2^(ADDR_WIDTH-2) 32-bit words
+  // Single 32-bit read/write per cycle maps to a single BRAM port,
+  // avoiding the 4-way byte-access pattern that defeats BRAM inference.
   // ------------------------------------------------------------------
-  logic [DATA_WIDTH-1:0] mem [0:(2**ADDR_WIDTH)-1];
+  localparam int WORD_ADDR_WIDTH = ADDR_WIDTH - 2;
+  localparam int NUM_WORDS       = 2**WORD_ADDR_WIDTH;
+
+  logic [DATA_WIDTH-1:0] mem [0:NUM_WORDS-1];
 
   initial begin
     $readmemh("machine_code.mem", mem);
@@ -58,9 +64,9 @@ module main_memory #(
   logic [$clog2(LATENCY+1)-1:0] lat_cnt;
   logic [$clog2(BURST_LEN)-1:0] burst_cnt;
 
-  // Current word address (line-aligned + burst offset)
-  logic [ADDR_WIDTH-1:0]        cur_byte_addr;
-  assign cur_byte_addr = latched_addr[ADDR_WIDTH-1:0] + (burst_cnt << 2);
+  // Current word address (line-aligned + burst offset), in 32-bit word units
+  logic [WORD_ADDR_WIDTH-1:0] cur_word_addr;
+  assign cur_word_addr = latched_addr[ADDR_WIDTH-1:2] + burst_cnt;
 
   // ------------------------------------------------------------------
   // Arbitration: D-Cache has priority
@@ -135,23 +141,19 @@ module main_memory #(
   end
 
   // ------------------------------------------------------------------
-  // Write Logic (D-Cache writeback)
+  // Write Logic (D-Cache writeback) - single 32-bit word per cycle
   // ------------------------------------------------------------------
   always_ff @(posedge clk) begin
     if (state == MEM_DCACHE_BURST_WR) begin
-      mem[cur_byte_addr  ] <= dcache_wr_data[7:0];
-      mem[cur_byte_addr+1] <= dcache_wr_data[15:8];
-      mem[cur_byte_addr+2] <= dcache_wr_data[23:16];
-      mem[cur_byte_addr+3] <= dcache_wr_data[31:24];
+      mem[cur_word_addr] <= dcache_wr_data;
     end
   end
 
   // ------------------------------------------------------------------
-  // Read Logic (combinational assembly of 4 bytes)
+  // Read Logic - single 32-bit word read, BRAM-friendly
   // ------------------------------------------------------------------
   logic [31:0] read_word;
-  assign read_word = {mem[cur_byte_addr+3], mem[cur_byte_addr+2],
-                      mem[cur_byte_addr+1], mem[cur_byte_addr  ]};
+  assign read_word = mem[cur_word_addr];
 
   // ------------------------------------------------------------------
   // Output Drivers

@@ -14,7 +14,8 @@ module l1_dcache #(
   localparam OFFSET_W    = WORD_OFF_W + BYTE_OFF_W,
   localparam TAG_W       = XLEN - INDEX_W - OFFSET_W,
   localparam DATA_DEPTH  = NUM_LINES * LINE_WORDS
-)(
+)
+(
   input  logic             clk,
   input  logic             reset_n,
 
@@ -38,21 +39,19 @@ module l1_dcache #(
   input  logic             mem_ready
 );
 
-  // ------------------------------------------------------------------
+  
   // Storage (BRAM-inferred)
-  // ------------------------------------------------------------------
-  (* ram_style = "block" *)
+  (* ram_style = "distributed" *)
   logic [TAG_W-1:0] tag_array  [NUM_LINES];
 
-  (* ram_style = "block" *)
+  (* ram_style = "distributed" *)
   logic [31:0]      data_array [DATA_DEPTH];
 
   logic [NUM_LINES-1:0] valid_r;
   logic [NUM_LINES-1:0] dirty_r;
 
-  // ------------------------------------------------------------------
+  
   // Address Decomposition
-  // ------------------------------------------------------------------
   logic [INDEX_W-1:0]    req_index;
   logic [WORD_OFF_W-1:0] req_word_off;
   logic [BYTE_OFF_W-1:0] req_byte_off;
@@ -63,9 +62,8 @@ module l1_dcache #(
   assign req_index    = cpu_addr[OFFSET_W +: INDEX_W];
   assign req_tag      = cpu_addr[OFFSET_W + INDEX_W +: TAG_W];
 
-  // ------------------------------------------------------------------
+
   // Latched request (held during multi-cycle access)
-  // ------------------------------------------------------------------
   logic [INDEX_W-1:0]    lat_index;
   logic [WORD_OFF_W-1:0] lat_word_off;
   logic [BYTE_OFF_W-1:0] lat_byte_off;
@@ -75,9 +73,8 @@ module l1_dcache #(
   logic [31:0]           lat_wr_data;
   logic                  lat_zero_ext;
 
-  // ------------------------------------------------------------------
+  
   // Registered BRAM outputs (1-cycle latency)
-  // ------------------------------------------------------------------
   logic [TAG_W-1:0] rd_tag_reg;
   logic [31:0]      rd_word_reg;
   logic             valid_reg;
@@ -93,15 +90,13 @@ module l1_dcache #(
     dirty_reg   <= dirty_r[req_index];
   end
 
-  // ------------------------------------------------------------------
+  
   // Hit detection (uses latched tag after first cycle)
-  // ------------------------------------------------------------------
   logic hit;
   assign hit = valid_reg && (rd_tag_reg == lat_tag);
 
-  // ------------------------------------------------------------------
+  
   // State Machine
-  // ------------------------------------------------------------------
   cache_state_t state, next_state;
 
   // Burst counters
@@ -114,42 +109,42 @@ module l1_dcache #(
   always_comb begin
     next_state = state;
     case (state)
-      CACHE_IDLE:
+       CACHE_IDLE:
         if (cpu_req) next_state = CACHE_COMPARE;
 
-      CACHE_COMPARE: begin
+       CACHE_COMPARE: begin
         if (hit) begin
           // Stay; transition to IDLE only when no new request
           if (!cpu_req) next_state = CACHE_IDLE;
         end
+
         else begin
           // Miss
-          if (valid_reg && dirty_reg)
-            next_state = CACHE_WRITE_BACK;
-          else
-            next_state = CACHE_ALLOCATE;
+          if (valid_reg && dirty_reg) next_state = CACHE_WRITE_BACK;
+          else next_state = CACHE_ALLOCATE;
         end
-      end
+       end
 
-      CACHE_WRITE_BACK:
+       CACHE_WRITE_BACK:
         if (mem_ready) next_state = CACHE_ALLOCATE;
 
-      CACHE_ALLOCATE:
+       CACHE_ALLOCATE:
         if (mem_ready) next_state = CACHE_COMPARE;
 
-      default: next_state = CACHE_IDLE;
+       default: next_state = CACHE_IDLE;
     endcase
   end
 
-  // ------------------------------------------------------------------
+  
   // Byte-enable merge helper for store hits
-  // ------------------------------------------------------------------
+  
   function automatic logic [31:0] merge_store (
     input logic [31:0]      orig,
     input logic [31:0]      wr,
     input mem_size_t        sz,
     input logic [BYTE_OFF_W-1:0] bo
   );
+
     logic [31:0] result;
     begin
       result = orig;
@@ -163,20 +158,24 @@ module l1_dcache #(
             default: ;
           endcase
         end
+
         HALF_WORD: begin
           if (bo[1] == 1'b0) result[15:0]  = wr[15:0];
-          else               result[31:16] = wr[15:0];
+
+          else result[31:16] = wr[15:0];
         end
+
         WORD: result = wr;
+
         default: ;
+
       endcase
       return result;
     end
   endfunction
 
-  // ------------------------------------------------------------------
+
   // Load extraction helper for load hits
-  // ------------------------------------------------------------------
   function automatic logic [31:0] extract_load (
     input logic [31:0]      word,
     input mem_size_t        sz,
@@ -209,11 +208,9 @@ module l1_dcache #(
     end
   endfunction
 
-  // ------------------------------------------------------------------
-  // Sequential state + side effects
-  // ------------------------------------------------------------------
-  logic [31:0] merged_word;
 
+  // Sequential state + side effects
+  // FSM + Control Flops (With Asynchronous Reset)
   always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
       state        <= CACHE_IDLE;
@@ -233,7 +230,7 @@ module l1_dcache #(
     end
     else begin
       state <= next_state;
-
+      
       // Latch request when entering COMPARE
       if (state == CACHE_IDLE && cpu_req) begin
         lat_index    <= req_index;
@@ -261,11 +258,12 @@ module l1_dcache #(
         end
       end
 
-      // Fill burst counter
+      // Fill burst counter & Control updates
       if (state == CACHE_ALLOCATE) begin
         if (mem_data_valid) fill_cnt <= fill_cnt + 1;
+
         if (mem_ready) begin
-          tag_array[lat_index] <= lat_tag;
+          // Mark line valid and clean after fill completes
           valid_r[lat_index]   <= 1'b1;
           dirty_r[lat_index]   <= 1'b0;
           fill_cnt             <= '0;
@@ -279,35 +277,66 @@ module l1_dcache #(
     end
   end
 
-  // ------------------------------------------------------------------
+
+  // Memory Arrays Write Block (Synchronous ONLY - No Reset)
+  always_ff @(posedge clk) begin
+    // Tag array write during ALLOCATE (separate always_ff for clean inference)
+    if (state == CACHE_ALLOCATE && mem_ready) begin
+        tag_array[lat_index] <= lat_tag;
+    end
+  end
+  
+
+
+
   // BRAM writes (store hit merge + fill write)
-  // ------------------------------------------------------------------
   always_ff @(posedge clk) begin
     // Fill write
     if (state == CACHE_ALLOCATE && mem_data_valid) begin
       data_array[{lat_index, fill_cnt}] <= mem_data;
     end
+
     // Store hit: read-modify-write
     else if (state == CACHE_COMPARE && hit && lat_wr_en) begin
-      data_array[{lat_index, lat_word_off}] <=
-        merge_store(rd_word_reg, lat_wr_data, lat_size, lat_byte_off);
+      data_array[{lat_index, lat_word_off}] <= merge_store(rd_word_reg, lat_wr_data, lat_size, lat_byte_off);
     end
   end
 
-  // ------------------------------------------------------------------
+  
   // Memory Interface
-  // ------------------------------------------------------------------
-  assign mem_req     = (state == CACHE_ALLOCATE) || (state == CACHE_WRITE_BACK);
-  assign mem_wr_en   = (state == CACHE_WRITE_BACK);
-  assign mem_addr    = (state == CACHE_WRITE_BACK)
-                         ? {evict_tag, lat_index, {OFFSET_W{1'b0}}}
-                         : {lat_tag,   lat_index, {OFFSET_W{1'b0}}};
-  assign mem_wr_data = data_array[{lat_index, wb_cnt}];
+  assign mem_req = (state == CACHE_ALLOCATE) || (state == CACHE_WRITE_BACK);
+  assign mem_wr_en = (state == CACHE_WRITE_BACK);
+  assign mem_addr = (state == CACHE_WRITE_BACK) ? {evict_tag, lat_index, {OFFSET_W{1'b0}}} : {lat_tag, lat_index, {OFFSET_W{1'b0}}};
 
-  // ------------------------------------------------------------------
+ // Read-ahead counter for the write-back burst
+ /*logic [WORD_OFF_W-1:0] wb_rd_cnt;
+
+  always_ff @(posedge clk or negedge reset_n) begin
+  if (!reset_n) wb_rd_cnt <= '0;
+
+  else 
+  if (state == CACHE_COMPARE && !hit && valid_reg && dirty_reg) wb_rd_cnt <= '0; // about to enter WRITE_BACK
+
+   else 
+   if (state == CACHE_WRITE_BACK) wb_rd_cnt <= wb_rd_cnt + 1'b1;
+ end*/
+
+ // Synchronous BRAM read — inferred cleanly now
+ logic [31:0] wb_rd_word;
+ always_ff @(posedge clk) begin
+   wb_rd_word <= data_array[{lat_index, 2'b00} + wb_cnt]; // Read the current word being written back for write-back merging
+ end
+ assign mem_wr_data = wb_rd_word;
+  
+
+  
   // CPU Outputs
-  // ------------------------------------------------------------------
   assign cpu_ready   = (state == CACHE_COMPARE) && hit;
   assign cpu_rd_data = extract_load(rd_word_reg, lat_size, lat_byte_off, lat_zero_ext);
+
+
+  // Explicit sink for byte-offset bits to prevent warnings (not used since we handle unaligned accesses in the merge/extract functions)
+  wire _unused_addr_bits;
+  assign _unused_addr_bits = &{1'b0, cpu_addr[1:0]};
 
 endmodule

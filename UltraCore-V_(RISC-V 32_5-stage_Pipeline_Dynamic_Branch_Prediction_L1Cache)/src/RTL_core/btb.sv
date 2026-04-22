@@ -104,6 +104,11 @@ localparam DATA_W  = TAG_W + XLEN + 2 )
   always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
       s1_valid <= 1'b0;
+      s1_index         <= '0;
+      s1_tag           <= '0;
+      s1_actual_target <= '0;
+      s1_was_taken     <= 1'b0;
+      s1_entry_valid   <= 1'b0;
     end 
     
     else begin
@@ -116,14 +121,14 @@ localparam DATA_W  = TAG_W + XLEN + 2 )
     end
   end
 
-  // ---- BRAM Port B: true dual-port read/write ----
+  //  BRAM Port B: true dual-port read/write 
   always_ff @(posedge clk) begin
     if (portb_we)
       btb_bram[portb_addr] <= wr_data;    // Stage 2: write-back
     s1_rd_data <= btb_bram[portb_addr];   // Stage 1: read (read-first mode)
   end
 
-  // ---- Stage 2: Hit detection + state computation ----
+  // Stage 2: Hit detection + state computation 
 
   // Unpack stage 1 BRAM read data
   assign s1_stored_tag   = s1_rd_data[DATA_W-1 -: TAG_W];
@@ -156,5 +161,7 @@ localparam DATA_W  = TAG_W + XLEN + 2 )
     else if (s1_valid)
       valid_r[s1_index] <= 1'b1;
   end
-
+ // Explicit sink for byte-offset bits (word-aligned fetch) to prevent "unused input" warnings
+  wire _unused_pc_bits;
+  assign _unused_pc_bits = &{1'b0, pc[1:0], update_pc[1:0]};
 endmodule

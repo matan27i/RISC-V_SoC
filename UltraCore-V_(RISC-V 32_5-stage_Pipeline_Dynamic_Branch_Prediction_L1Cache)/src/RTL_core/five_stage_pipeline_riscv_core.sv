@@ -1,7 +1,7 @@
 // Top-Level 5-Stage Pipelined RISC-V Core
 import risc_pkg::*;
 
-module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
+module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
 (
   input  logic             clk,
   input  logic             reset_n,
@@ -22,7 +22,7 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
 
   
   //  IF Stage Signals
-  logic [XLEN-1:0] pc, next_pc, next_seq_pc;
+  logic [XLEN-1:0] pc, next_seq_pc;
   logic [31:0]     instruction;
   logic            icache_ready;
 
@@ -198,7 +198,7 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
   l1_icache u_l1_icache (
     .clk             (clk),
     .reset_n         (reset_n),
-    .cpu_req         (reset_n),
+    .cpu_req         (1'b1),
     .cpu_addr        (btb_lookup_addr),     // Lookahead address (aligned with current PC)
     .cpu_data        (instruction),
     .cpu_ready       (icache_ready),
@@ -278,7 +278,7 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     .u_type           (u_type),
     .j_type           (j_type),
     .funct3           (funct3),
-    .funct7           (funct7),
+    .funct7_bit5      (instruction[30]), // For SRLI vs SRAI
     .opcode           (opcode),
     .pc_sel           (pc_sel),
     .op1_sel          (op1_sel),
@@ -449,8 +449,7 @@ module \5pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     .alu_a   (alu_a),
     .alu_b   (alu_b),
     .alu_op  (id_ex_alu_op),
-    .alu_res (alu_res),
-    .zero    ()
+    .alu_res (alu_res)
   );
 
   // Branch Control (resolved in EX using forwarded operands)
