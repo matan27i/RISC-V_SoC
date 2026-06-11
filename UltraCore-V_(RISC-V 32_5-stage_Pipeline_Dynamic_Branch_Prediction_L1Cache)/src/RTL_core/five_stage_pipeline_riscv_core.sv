@@ -1,11 +1,84 @@
 // Top-Level 5-Stage Pipelined RISC-V Core
+// ----------------------------------------------------------------
+// Timing optimizations (target: 100 MHz / 10 ns period):
+//  (1) Pipelined redirect  — ex_redirect/target registered before
+//      reaching IF. Breaks the long EX→IF combinational path that
+//      forced BRAM address pins to settle within the ALU+compare
+//      critical path. +1 cycle mispredict penalty (2→3).
+//  (2) Branch Target Adder — dedicated pc+imm adder in parallel
+//      with the ALU. B-type / JAL bypass the 32-bit ALU carry
+//      chain on the mispredict path.
+//  (3) Pre-registered forwarding selects — fwd_a_sel/fwd_b_sel
+//      computed in ID (using id_ex_rd_addr and ex_mem_rd_addr as
+//      proxies for next cycle's ex_mem_rd_addr and mem_wb_rd_addr)
+//      then registered into ID/EX. Removes 4 address comparators
+//      from the EX critical path.
+//  (4) max_fanout attributes on high-fanout pipeline regs so
+//      Vivado auto-replicates (reduces 11 ns net delay).
+//  (5) JALR Target Adder — dedicated rs1+imm adder in parallel
+//      with the ALU. Removes the ALU's 10-way output case-mux
+//      (~1.5 ns) from the JALR mispredict path. Combined with
+//      Opt 2, no branch/jump target now goes through the ALU,
+//      so alu_res only feeds the ex_mem_alu_res register
+//      (register-to-register).
+// ----------------------------------------------------------------
+
+// ----------------------------------------------------------------
+// SoC integration (UltraCore-V):
+//  (a) MMIO bypass — data accesses outside the cacheable RAM window
+//      (peripherals at/above 0x4000_0000 and the boot-ROM data window
+//      below 0x0000_2000) bypass the write-back D-cache through a
+//      native MMIO port served by axi_master_bridge. A dedicated
+//      mmio_stall freezes the pipeline for the duration of the bus
+//      transaction, giving strongly-ordered, uncached device access.
+//  (b) Boot ROM fetch routing — I-cache line fills for addresses below
+//      0x0000_2000 are routed to the external boot_rom burst port
+//      instead of main_memory. Fill addresses are stable per miss, so
+//      the route is a safe combinational decode.
+//  (c) Interrupt pins — irq_timer / irq_ecc are registered as pending
+//      hooks for a future Zicsr/trap unit; no trap logic exists yet.
+//  Cacheable RAM window: 0x0000_2000 - 0x0000_3FFF (16 KB backing
+//  store, upper half; addresses above it up to 0x3FFF_FFFF alias RAM
+//  and are reserved — software must not use them).
+// ----------------------------------------------------------------
+
 import risc_pkg::*;
 
-module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
+module five_stage_pipeline_riscv_core #(
+  parameter RESET_PC      = 32'h0000,
+  parameter MEM_INIT_FILE = "machine_code.mem"
+)
 (
   input  logic             clk,
   input  logic             reset_n,
-  output logic [XLEN-1:0]  pc_out
+  output logic [XLEN-1:0]  pc_out,
+
+  // MMIO master port (uncached; request fields stable while stalled)
+  output logic             mmio_req,
+  output logic             mmio_wr_en,
+  output logic [XLEN-1:0]  mmio_addr,
+  output logic [31:0]      mmio_wr_data,
+  output mem_size_t        mmio_size,
+  output logic             mmio_zero_extend,
+  input  logic [31:0]      mmio_rd_data,
+  input  logic             mmio_ready,
+  // High when the pipeline can consume an MMIO completion this cycle.
+  // The bridge holds its DONE state (mmio_ready level) until accepted,
+  // so a completion arriving under an I-/D-cache stall is neither lost
+  // nor re-issued (re-issuing would repeat device side effects).
+  output logic             mmio_accept,
+
+  // Boot ROM fetch-fill port (I-cache line fills for addr < 0x2000)
+  output logic             rom_fetch_req,
+  output logic [XLEN-1:0]  rom_fetch_addr,
+  input  logic [31:0]      rom_fetch_data,
+  input  logic             rom_fetch_data_valid,
+  input  logic             rom_fetch_ready,
+
+  // Interrupt request lines (synchronous, level). Registered below as
+  // pending hooks; trap/CSR logic is future work.
+  input  logic             irq_timer,
+  input  logic             irq_ecc
 );
 
   //  Internal Signals
@@ -13,14 +86,26 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
   logic hazard_stall;       // Load-use hazard stall (from hazard_detection)
   logic icache_stall;       // I-Cache miss stall
   logic dcache_stall;       // D-Cache miss stall
+  logic mmio_stall;         // MMIO (AXI) transaction in progress
   logic pipeline_stall;     // Composite: any source of pipeline stall
-  logic ex_redirect;        // Branch/jump taken in EX stage
-  logic effective_redirect; // Redirect gated by cache stalls
+  logic ex_redirect;        // Branch/jump mispredict in EX (combinational)
+  logic ex_redirect_qual;   // Gated by cache stalls (still combinational, internal)
 
-  assign pipeline_stall     = hazard_stall | icache_stall | dcache_stall;
-  assign effective_redirect = ex_redirect & ~icache_stall & ~dcache_stall;
+  // MMIO decode (MEM stage): peripherals at/above 0x4000_0000 and the
+  // boot-ROM data window below 0x2000 bypass the D-cache.
+  logic mmio_sel;           // Current MEM-stage access targets MMIO
+  logic dc_cpu_req;         // D-cache request, gated off for MMIO
 
-  
+  // Pipelined redirect — the single optimization that breaks the
+  // EX→IF combinational path. redir_valid_r is the flush signal
+  // seen by IF / IF-ID / ID-EX; redir_target_r is the new PC.
+  (* max_fanout = 32 *) logic            redir_valid_r;
+  logic [XLEN-1:0]                       redir_target_r;
+
+  assign pipeline_stall   = hazard_stall | icache_stall | dcache_stall | mmio_stall;
+  assign ex_redirect_qual = ex_redirect & ~icache_stall & ~dcache_stall & ~mmio_stall;
+
+
   //  IF Stage Signals
   logic [XLEN-1:0] pc, next_seq_pc;
   logic [31:0]     instruction;
@@ -45,11 +130,10 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
   //  D-Cache ready handshake
   logic             dcache_ready;
 
-  
+
   //  ID Stage Signals (Decode + Control + Register File)
   logic [6:0]      opcode;
   logic [2:0]      funct3;
-  logic [6:0]      funct7;
   logic [4:0]      rs1_addr, rs2_addr, rd_addr;
   logic [XLEN-1:0] rs1_data, rs2_data;
   logic [31:0]     immediate;
@@ -67,37 +151,45 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
   // WB-to-ID bypass (same-cycle register write + read)
   logic [XLEN-1:0] rs1_data_bypassed, rs2_data_bypassed;
 
+  // Pre-computed forwarding selects (Optimization 3)
+  logic [1:0]      pre_fwd_a_sel, pre_fwd_b_sel;
+
 
   //  BTB Signals
   // BRAM registered outputs (aligned with current PC via lookahead addressing)
   logic              btb_predict_taken;
-  logic [XLEN-1:0]  btb_predict_target;
+  logic [XLEN-1:0]   btb_predict_target;
 
   // Lookahead address — feeds BRAM 1 cycle early so output aligns with current PC
-  logic [XLEN-1:0]  btb_lookup_addr;
+  logic [XLEN-1:0]   btb_lookup_addr;
 
   // EX-stage update inputs
   logic              btb_update_en;
   logic              actual_taken;
-  logic [XLEN-1:0]  actual_target_addr;
+  logic [XLEN-1:0]   actual_target_addr;
   logic              btb_mispredict;
+
+  // Branch Target Adder — parallel to ALU (Optimization 2)
+  logic [XLEN-1:0]   bta_target;
+
+  // JALR Target Adder — parallel to ALU (Optimization 5)
+  logic [XLEN-1:0]   jalr_target;
 
 
   //  EX Stage Signals
   logic [XLEN-1:0] alu_a, alu_b, alu_res;
   logic [XLEN-1:0] fwd_rs1_data, fwd_rs2_data;  // Forwarded operands
-  logic [1:0]      fwd_a_sel, fwd_b_sel;         // Forwarding mux selects
   logic [XLEN-1:0] ex_mem_fwd_data;              // EX/MEM forwarding value
   logic [XLEN-1:0] ex_pc_plus_4;                 // PC+4 for JAL/JALR link
   logic            ex_branch_taken;              // Branch decision in EX
   logic [XLEN-1:0] ex_redirect_target;           // Branch/jump target
 
-  
+
   //  MEM Stage Signals
   logic [XLEN-1:0] dmem_rd_data;
 
-  
-  //  WB Stage Signals 
+
+  //  WB Stage Signals
   logic [XLEN-1:0] wr_data;
 
   //  Pipeline Registers
@@ -127,10 +219,15 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
   logic [XLEN-1:0] id_ex_rs2_data;
   logic [XLEN-1:0] id_ex_immediate;
 
-  // ID/EX — Register addresses (for forwarding)
-  logic [4:0]      id_ex_rs1_addr;
-  logic [4:0]      id_ex_rs2_addr;
-  logic [4:0]      id_ex_rd_addr;
+  // ID/EX — Destination register address (hazard detection + the
+  // pre-computed forwarding compares in ID). The rs1/rs2 address
+  // registers that once fed the EX-stage forwarding_unit were removed:
+  // dead since Optimization 3 inlined the selects into ID.
+  (* max_fanout = 32 *) logic [4:0]      id_ex_rd_addr;
+
+  // ID/EX — Pre-registered forwarding selects (Optimization 3)
+  logic [1:0]      id_ex_fwd_a_sel;
+  logic [1:0]      id_ex_fwd_b_sel;
 
   // ID/EX — BTB prediction (propagated from IF/ID for misprediction detection)
   logic            id_ex_btb_predict_taken;
@@ -147,7 +244,7 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
   // EX/MEM — Data
   logic [XLEN-1:0] ex_mem_alu_res;
   logic [XLEN-1:0] ex_mem_rs2_data;
-  logic [4:0]      ex_mem_rd_addr;
+  (* max_fanout = 32 *) logic [4:0]      ex_mem_rd_addr;
   logic [XLEN-1:0] ex_mem_pc_plus_4;
   logic [XLEN-1:0] ex_mem_immediate;
 
@@ -162,37 +259,63 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
   logic [XLEN-1:0] mem_wb_pc_plus_4;
   logic [XLEN-1:0] mem_wb_immediate;
 
-  
+
   //  IF Stage
-  // BTB lookahead address: mirrors PC mux so BRAM output is pre-aligned
+  // ----------------------------------------------------------------
+  // btb_lookup_addr is driven by the REGISTERED redirect (Opt 1).
+  // The combinational ex_redirect no longer reaches BRAM pins.
+  // ----------------------------------------------------------------
   always_comb begin
-    if (effective_redirect)
-      btb_lookup_addr = ex_redirect_target;
+    if (redir_valid_r)
+      btb_lookup_addr = redir_target_r;       // Registered redirect
     else if (btb_predict_taken && !pipeline_stall)
-      btb_lookup_addr = btb_predict_target;
+      btb_lookup_addr = btb_predict_target;   // BTB speculative
     else if (!pipeline_stall)
-      btb_lookup_addr = next_seq_pc;
+      btb_lookup_addr = next_seq_pc;          // Sequential
     else
-      btb_lookup_addr = pc;             // Stall — re-read same entry
+      btb_lookup_addr = pc;                   // Stall — hold
   end
 
-  // PC Register (priority: EX correction > BTB prediction > sequential)
+  // PC Register — now updated from the REGISTERED redirect
   always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n)
       pc <= RESET_PC;
 
-    else if (effective_redirect)
-      pc <= ex_redirect_target;         // Highest: misprediction correction
+    else if (redir_valid_r)
+      pc <= redir_target_r;                   // Registered mispredict recovery
 
     else if (btb_predict_taken && !pipeline_stall)
-      pc <= btb_predict_target;         // BTB speculative redirect
+      pc <= btb_predict_target;               // BTB speculative redirect
 
     else if (!pipeline_stall)
-      pc <= next_seq_pc;                // Sequential PC+4
+      pc <= next_seq_pc;                      // Sequential PC+4
   end
 
   assign next_seq_pc = pc + 32'h4;
   assign pc_out      = pc;
+
+  // ----------------------------------------------------------------
+  // Redirect pipeline register (Optimization 1)
+  // Captures ex_redirect/target in EX, applies one cycle later.
+  // One-shot: cleared the cycle after it fires.
+  // Frozen during cache stalls so the redirect is preserved.
+  // ----------------------------------------------------------------
+  always_ff @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+      redir_valid_r  <= 1'b0;
+      redir_target_r <= '0;
+    end
+    else if (icache_stall || dcache_stall || mmio_stall) begin
+      // Freeze during cache/MMIO stall
+    end
+    else if (redir_valid_r) begin
+      redir_valid_r  <= 1'b0;                 // Consumed this cycle
+    end
+    else if (ex_redirect_qual) begin
+      redir_valid_r  <= 1'b1;
+      redir_target_r <= ex_redirect_target;
+    end
+  end
 
   // L1 Instruction Cache — direct-mapped, BRAM-based, lookahead addressing
   l1_icache u_l1_icache (
@@ -224,7 +347,7 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     .was_taken      (actual_taken)
   );
 
-  // IF/ID Pipeline Register
+  // IF/ID Pipeline Register — flushed by registered redirect
   always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
       if_id_pc                 <= RESET_PC;
@@ -233,7 +356,8 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
       if_id_btb_predict_target <= '0;
     end
 
-    else if (effective_redirect) begin
+    else if (redir_valid_r) begin
+      // Flush the speculative instruction fetched while redirect was in flight
       if_id_pc                 <= RESET_PC;
       if_id_instr              <= 32'h00000013; // NOP
       if_id_btb_predict_taken  <= 1'b0;
@@ -249,7 +373,7 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     // else: cache stall — hold all IF/ID values
   end
 
-  
+
   //  ID Stage
   // Decode
   decode u_decode (
@@ -259,7 +383,7 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     .rd_addr     (rd_addr),
     .opcode      (opcode),
     .funct3      (funct3),
-    .funct7      (funct7),
+    .funct7      (),                // Unused: control derives funct7_bit5 from instr[30]
     .r_type      (r_type),
     .i_type      (i_type),
     .s_type      (s_type),
@@ -278,7 +402,7 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     .u_type           (u_type),
     .j_type           (j_type),
     .funct3           (funct3),
-    .funct7_bit5      (instruction[30]), // For SRLI vs SRAI
+    .funct7_bit5      (if_id_instr[30]), // For SRLI vs SRAI
     .opcode           (opcode),
     .pc_sel           (pc_sel),
     .op1_sel          (op1_sel),
@@ -305,7 +429,7 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     .rs2_data (rs2_data)
   );
 
-  // WB-to-ID handle same-cycle write+read conflict
+  // WB-to-ID handle same-cycle register write + read
   assign rs1_data_bypassed = (mem_wb_rf_wr_en && (mem_wb_rd_addr != 5'b0) && (mem_wb_rd_addr == rs1_addr))
                              ? wr_data : rs1_data;
 
@@ -320,6 +444,39 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     .id_ex_rd_addr         (id_ex_rd_addr),
     .stall                 (hazard_stall)
   );
+
+  // ----------------------------------------------------------------
+  // Pre-registered forwarding selects (Optimization 3)
+  //
+  // In cycle N (instr I in ID), the values currently in id_ex_rd_addr
+  // and ex_mem_rd_addr will be in ex_mem_rd_addr and mem_wb_rd_addr
+  // respectively when I reaches EX in cycle N+1. So comparing I's
+  // rs1/rs2 against those now is equivalent to the EX-stage compare
+  // that was formerly on the critical path.
+  //
+  // Encoding: 2'b01 = forward from EX/MEM, 2'b10 = forward from MEM/WB,
+  //           2'b00 = use id_ex_rs*_data (no forward).
+  // ----------------------------------------------------------------
+  always_comb begin
+    // Default: no forwarding
+    pre_fwd_a_sel = 2'b00;
+
+    // Forward from EX/MEM (what id_ex_rd_addr becomes next cycle).
+    // WB_SRC_MEM case is blocked by hazard unit, so we don't need to exclude it here.
+    if (id_ex_rf_wr_en && (id_ex_rd_addr != 5'b0) && (id_ex_rd_addr == rs1_addr))
+      pre_fwd_a_sel = 2'b01;
+    else if (ex_mem_rf_wr_en && (ex_mem_rd_addr != 5'b0) && (ex_mem_rd_addr == rs1_addr))
+      pre_fwd_a_sel = 2'b10;
+  end
+
+  always_comb begin
+    pre_fwd_b_sel = 2'b00;
+
+    if (id_ex_rf_wr_en && (id_ex_rd_addr != 5'b0) && (id_ex_rd_addr == rs2_addr))
+      pre_fwd_b_sel = 2'b01;
+    else if (ex_mem_rf_wr_en && (ex_mem_rd_addr != 5'b0) && (ex_mem_rd_addr == rs2_addr))
+      pre_fwd_b_sel = 2'b10;
+  end
 
   // ID/EX Pipeline Register
   always_ff @(posedge clk or negedge reset_n) begin
@@ -340,15 +497,18 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
       id_ex_rs1_data           <= '0;
       id_ex_rs2_data           <= '0;
       id_ex_immediate          <= '0;
-      id_ex_rs1_addr           <= 5'b0;
-      id_ex_rs2_addr           <= 5'b0;
       id_ex_rd_addr            <= 5'b0;
+      id_ex_fwd_a_sel          <= 2'b00;
+      id_ex_fwd_b_sel          <= 2'b00;
       id_ex_btb_predict_taken  <= 1'b0;
       id_ex_btb_predict_target <= '0;
-    end 
-    
-    // Bubble: on effective redirect OR hazard-only stall (not cache stall)
-    else if (effective_redirect || (hazard_stall && !icache_stall && !dcache_stall)) begin
+    end
+
+    // Bubble on:
+    //  - Registered redirect (flush the speculative instr that was
+    //    in ID when the branch resolved in EX)
+    //  - Load-use hazard (not during cache/MMIO stall — pipe is frozen)
+    else if (redir_valid_r || (hazard_stall && !icache_stall && !dcache_stall && !mmio_stall)) begin
       id_ex_rf_wr_en           <= 1'b0;
       id_ex_rf_wr_data_sel     <= WB_SRC_ALU;
       id_ex_dmem_wr_en         <= 1'b0;
@@ -365,9 +525,9 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
       id_ex_rs1_data           <= '0;
       id_ex_rs2_data           <= '0;
       id_ex_immediate          <= '0;
-      id_ex_rs1_addr           <= 5'b0;
-      id_ex_rs2_addr           <= 5'b0;
       id_ex_rd_addr            <= 5'b0;
+      id_ex_fwd_a_sel          <= 2'b00;
+      id_ex_fwd_b_sel          <= 2'b00;
       id_ex_btb_predict_taken  <= 1'b0;
       id_ex_btb_predict_target <= '0;
     end
@@ -390,28 +550,21 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
       id_ex_rs1_data           <= rs1_data_bypassed;
       id_ex_rs2_data           <= rs2_data_bypassed;
       id_ex_immediate          <= immediate;
-      id_ex_rs1_addr           <= rs1_addr;
-      id_ex_rs2_addr           <= rs2_addr;
       id_ex_rd_addr            <= rd_addr;
+      id_ex_fwd_a_sel          <= pre_fwd_a_sel;
+      id_ex_fwd_b_sel          <= pre_fwd_b_sel;
       id_ex_btb_predict_taken  <= if_id_btb_predict_taken;
       id_ex_btb_predict_target <= if_id_btb_predict_target;
     end
     // else: cache stall — hold all ID/EX registers
   end
 
-  
+
   //  EX Stage
-  // Forwarding Unit
-  forwarding_unit u_forwarding_unit (
-    .id_ex_rs1_addr (id_ex_rs1_addr),
-    .id_ex_rs2_addr (id_ex_rs2_addr),
-    .ex_mem_rf_wr_en (ex_mem_rf_wr_en),
-    .ex_mem_rd_addr  (ex_mem_rd_addr),
-    .mem_wb_rf_wr_en (mem_wb_rf_wr_en),
-    .mem_wb_rd_addr  (mem_wb_rd_addr),
-    .fwd_a_sel       (fwd_a_sel),
-    .fwd_b_sel       (fwd_b_sel)
-  );
+  // ----------------------------------------------------------------
+  // Forwarding muxes — NO comparators on the critical path anymore.
+  // id_ex_fwd_{a,b}_sel were computed in ID and registered.
+  // ----------------------------------------------------------------
 
   // EX/MEM forwarding value: select the correct writeback data type
   always_comb begin
@@ -423,25 +576,24 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     endcase
   end
 
-  // Forwarding muxes
   always_comb begin
-    case (fwd_a_sel)
-      2'b01:   fwd_rs1_data = ex_mem_fwd_data;  // Forward from EX/MEM
+    case (id_ex_fwd_a_sel)
+      2'b01:   fwd_rs1_data = ex_mem_fwd_data;   // Forward from EX/MEM
       2'b10:   fwd_rs1_data = wr_data;           // Forward from MEM/WB
       default: fwd_rs1_data = id_ex_rs1_data;    // No forwarding
     endcase
   end
 
   always_comb begin
-    case (fwd_b_sel)
-      2'b01:   fwd_rs2_data = ex_mem_fwd_data;  // Forward from EX/MEM
-      2'b10:   fwd_rs2_data = wr_data;           // Forward from MEM/WB
-      default: fwd_rs2_data = id_ex_rs2_data;    // No forwarding
+    case (id_ex_fwd_b_sel)
+      2'b01:   fwd_rs2_data = ex_mem_fwd_data;
+      2'b10:   fwd_rs2_data = wr_data;
+      default: fwd_rs2_data = id_ex_rs2_data;
     endcase
   end
 
   // ALU operand muxes (use forwarded data)
-  assign alu_a = id_ex_op1_sel ? id_ex_pc       : fwd_rs1_data;
+  assign alu_a = id_ex_op1_sel ? id_ex_pc        : fwd_rs1_data;
   assign alu_b = id_ex_op2_sel ? id_ex_immediate : fwd_rs2_data;
 
   // ALU
@@ -461,15 +613,33 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     .branch_taken (ex_branch_taken)
   );
 
-  // EX-stage: Actual branch/jump outcome
+  // ----------------------------------------------------------------
+  // Branch Target Adder (Optimization 2) — B-type / JAL
+  //
+  // target = pc + imm. Both inputs are registered in ID/EX, so this
+  // adder runs in parallel with the ALU carry chain.
+  //
+  // JALR Target Adder (Optimization 5) — JALR
+  //
+  // target = rs1 + imm. Uses the already-forwarded rs1 value, and
+  // sidesteps the ALU's 10-way output case-mux. JALR is identified
+  // by pc_sel=1 AND op1_sel=0 (distinguishes it from JAL which has
+  // op1_sel=1). After Opts 2 & 5, no branch/jump target goes
+  // through alu_res — the ALU is no longer on the EX→IF path.
+  // ----------------------------------------------------------------
+  assign bta_target  = id_ex_pc       + id_ex_immediate;
+  assign jalr_target = fwd_rs1_data   + id_ex_immediate;
+
   assign actual_taken      = ex_branch_taken | id_ex_pc_sel;
-  assign actual_target_addr = {alu_res[XLEN-1:1], 1'b0};
+  assign actual_target_addr = (id_ex_pc_sel & ~id_ex_op1_sel)
+                              ? {jalr_target[XLEN-1:1], 1'b0}  // JALR: dedicated adder
+                              : {bta_target[XLEN-1:1],  1'b0}; // B-type / JAL: BTA
 
   // BTB update enable: fire for any branch or jump instruction in EX
   assign btb_update_en = id_ex_b_type | id_ex_pc_sel;
 
-  
-  assign btb_mispredict = (id_ex_btb_predict_taken != actual_taken) || (actual_taken && (id_ex_btb_predict_target != actual_target_addr));
+  assign btb_mispredict = (id_ex_btb_predict_taken != actual_taken)
+                          || (actual_taken && (id_ex_btb_predict_target != actual_target_addr));
 
   // Redirect only on misprediction (correct prediction = no pipeline flush)
   assign ex_redirect        = btb_mispredict;
@@ -478,7 +648,15 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
   // PC+4 for JAL/JALR link register writeback (and not-taken correction target)
   assign ex_pc_plus_4 = id_ex_pc + 32'h4;
 
-  // EX/MEM Pipeline Register — freeze on cache stall
+  // ----------------------------------------------------------------
+  // EX/MEM Pipeline Register
+  //
+  // Squash the speculative instruction that was in EX when the
+  // registered redirect fires. Its control signals were set based
+  // on the pre-redirect pipeline state, so we must mask its side-
+  // effects (RF write, DMEM req/wr) here. The data itself doesn't
+  // matter because nothing downstream commits it.
+  // ----------------------------------------------------------------
   always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
       ex_mem_rf_wr_en         <= 1'b0;
@@ -494,11 +672,12 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
       ex_mem_immediate        <= '0;
     end
 
-    else if (!icache_stall && !dcache_stall) begin
-      ex_mem_rf_wr_en         <= id_ex_rf_wr_en;
+    else if (!icache_stall && !dcache_stall && !mmio_stall) begin
+      // Squash side-effects when a registered redirect is in flight.
+      ex_mem_rf_wr_en         <= id_ex_rf_wr_en   & ~redir_valid_r;
+      ex_mem_dmem_req         <= id_ex_dmem_req   & ~redir_valid_r;
+      ex_mem_dmem_wr_en       <= id_ex_dmem_wr_en & ~redir_valid_r;
       ex_mem_rf_wr_data_sel   <= id_ex_rf_wr_data_sel;
-      ex_mem_dmem_wr_en       <= id_ex_dmem_wr_en;
-      ex_mem_dmem_req         <= id_ex_dmem_req;
       ex_mem_dmem_size        <= id_ex_dmem_size;
       ex_mem_dmem_zero_extend <= id_ex_dmem_zero_extend;
       ex_mem_alu_res          <= alu_res;
@@ -510,13 +689,37 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     // else: cache stall — hold
   end
 
-  
+
   //  MEM Stage
+  // ----------------------------------------------------------------
+  // MMIO decode (SoC integration): a data access leaves the cacheable
+  // RAM window when it targets the peripheral space (>= 0x4000_0000,
+  // i.e. addr[31] | addr[30]) or the boot-ROM data window (< 0x2000).
+  // Such accesses are steered to the native MMIO port; the D-cache
+  // never sees them, so device registers are never cached and stores
+  // reach the peripheral before the pipeline resumes.
+  // ----------------------------------------------------------------
+  assign mmio_sel   = ex_mem_dmem_req &
+                      ((|ex_mem_alu_res[31:30]) | (ex_mem_alu_res < 32'h0000_2000));
+  assign dc_cpu_req = ex_mem_dmem_req & ~mmio_sel;
+
+  // MMIO port: fields come straight from EX/MEM registers, which are
+  // frozen while mmio_stall holds the pipeline — stable by design.
+  assign mmio_req         = mmio_sel;
+  assign mmio_wr_en       = ex_mem_dmem_wr_en;
+  assign mmio_addr        = ex_mem_alu_res;
+  assign mmio_wr_data     = ex_mem_rs2_data;
+  assign mmio_size        = ex_mem_dmem_size;
+  assign mmio_zero_extend = ex_mem_dmem_zero_extend;
+
+  assign mmio_stall  = mmio_sel & ~mmio_ready;
+  assign mmio_accept = ~icache_stall & ~dcache_stall;
+
   // L1 Data Cache — direct-mapped, BRAM-based, write-back policy
   l1_dcache u_l1_dcache (
     .clk              (clk),
     .reset_n          (reset_n),
-    .cpu_req          (ex_mem_dmem_req),
+    .cpu_req          (dc_cpu_req),
     .cpu_wr_en        (ex_mem_dmem_wr_en),
     .cpu_data_size    (ex_mem_dmem_size),
     .cpu_addr         (ex_mem_alu_res),
@@ -533,18 +736,40 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     .mem_ready        (dc_mem_ready)
   );
 
-  // D-Cache stall: only when a valid memory request is outstanding and not ready
-  assign dcache_stall = ex_mem_dmem_req & ~dcache_ready;
+  // D-Cache stall: only for cacheable requests (MMIO is gated off)
+  assign dcache_stall = dc_cpu_req & ~dcache_ready;
+
+  // ----------------------------------------------------------------
+  // Fetch router (SoC integration): I-cache line fills below 0x2000
+  // are served by the external boot ROM, everything else by main
+  // memory. The fill address is held stable for the whole miss
+  // (l1_icache drives it from latched miss_tag/miss_index), so the
+  // combinational route cannot change mid-burst.
+  // ----------------------------------------------------------------
+  logic        ic_rom_sel;
+  logic [31:0] mm_ic_data;
+  logic        mm_ic_data_valid;
+  logic        mm_ic_ready;
+
+  assign ic_rom_sel     = (ic_mem_addr < 32'h0000_2000);
+  assign rom_fetch_req  = ic_mem_req & ic_rom_sel;
+  assign rom_fetch_addr = ic_mem_addr;
+
+  assign ic_mem_data       = ic_rom_sel ? rom_fetch_data       : mm_ic_data;
+  assign ic_mem_data_valid = ic_rom_sel ? rom_fetch_data_valid : mm_ic_data_valid;
+  assign ic_mem_ready      = ic_rom_sel ? rom_fetch_ready      : mm_ic_ready;
 
   // Main Memory Controller — unified backing store with arbiter
-  main_memory u_main_memory (
+  main_memory #(
+    .MEM_INIT_FILE (MEM_INIT_FILE)
+  ) u_main_memory (
     .clk                (clk),
     .reset_n            (reset_n),
-    .icache_req         (ic_mem_req),
+    .icache_req         (ic_mem_req & ~ic_rom_sel),
     .icache_addr        (ic_mem_addr),
-    .icache_data        (ic_mem_data),
-    .icache_data_valid  (ic_mem_data_valid),
-    .icache_ready       (ic_mem_ready),
+    .icache_data        (mm_ic_data),
+    .icache_data_valid  (mm_ic_data_valid),
+    .icache_ready       (mm_ic_ready),
     .dcache_req         (dc_mem_req),
     .dcache_wr_en       (dc_mem_wr_en),
     .dcache_addr        (dc_mem_addr),
@@ -554,7 +779,14 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
     .dcache_ready       (dc_mem_ready)
   );
 
-  // MEM/WB Pipeline Register — freeze on D-Cache stall
+  // MEM/WB Pipeline Register — freezes under the SAME condition as
+  // EX/MEM. (Bug fix: the original gate was !dcache_stall only, so
+  // during an I-cache stall MEM/WB kept re-latching the frozen EX/MEM
+  // content. That overwrote the WB-stage value one cycle into the
+  // stall and corrupted any instruction sitting in EX that forwarded
+  // its operand from MEM/WB — a latent bug independent of the SoC
+  // integration. Uniform freeze restores the stage alignment the
+  // pre-computed forwarding selects rely on.)
   always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
       mem_wb_rf_wr_en       <= 1'b0;
@@ -566,19 +798,43 @@ module five_stage_pipeline_riscv_core #(parameter RESET_PC = 32'h0000)
       mem_wb_immediate      <= '0;
     end
 
-    else if (!dcache_stall) begin
+    else if (!icache_stall && !dcache_stall && !mmio_stall) begin
       mem_wb_rf_wr_en       <= ex_mem_rf_wr_en;
       mem_wb_rf_wr_data_sel <= ex_mem_rf_wr_data_sel;
       mem_wb_alu_res        <= ex_mem_alu_res;
-      mem_wb_dmem_rd_data   <= dmem_rd_data;
+      // Load data source: MMIO loads return through the AXI bridge,
+      // cacheable loads through the D-cache
+      mem_wb_dmem_rd_data   <= mmio_sel ? mmio_rd_data : dmem_rd_data;
       mem_wb_rd_addr        <= ex_mem_rd_addr;
       mem_wb_pc_plus_4      <= ex_mem_pc_plus_4;
       mem_wb_immediate      <= ex_mem_immediate;
     end
-    // else: D-cache stall — hold
+    // else: D-cache / MMIO stall — hold
   end
 
-  
+  // ----------------------------------------------------------------
+  // Interrupt pending hooks (SoC integration). The RV32I core has no
+  // CSR/trap unit yet; these registers give the future Zicsr block a
+  // clean, already-synchronous attachment point and let waveform
+  // debug observe the lines today.
+  // ----------------------------------------------------------------
+  logic irq_timer_pending_r, irq_ecc_pending_r;
+
+  always_ff @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+      irq_timer_pending_r <= 1'b0;
+      irq_ecc_pending_r   <= 1'b0;
+    end
+    else begin
+      irq_timer_pending_r <= irq_timer;
+      irq_ecc_pending_r   <= irq_ecc;
+    end
+  end
+
+  wire _unused_irq_hooks;
+  assign _unused_irq_hooks = &{1'b0, irq_timer_pending_r, irq_ecc_pending_r};
+
+
   //  WB Stage
   always_comb begin
     case (mem_wb_rf_wr_data_sel)

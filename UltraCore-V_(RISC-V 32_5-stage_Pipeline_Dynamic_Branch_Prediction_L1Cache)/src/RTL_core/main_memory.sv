@@ -5,10 +5,11 @@
 import risc_pkg::*;
 
 module main_memory #(
-  parameter ADDR_WIDTH = 14,       // 16 KB backing store (byte-addressable at IF)
-  parameter DATA_WIDTH = 32,       // Word-wide storage (BRAM-friendly)
-  parameter LATENCY    = 10,       // Cycles before first burst word
-  parameter BURST_LEN  = 4         // Words per burst (= LINE_WORDS)
+  parameter ADDR_WIDTH    = 14,    // 16 KB backing store (byte-addressable at IF)
+  parameter DATA_WIDTH    = 32,    // Word-wide storage (BRAM-friendly)
+  parameter LATENCY       = 10,    // Cycles before first burst word
+  parameter BURST_LEN     = 4,     // Words per burst (= LINE_WORDS)
+  parameter MEM_INIT_FILE = "machine_code.mem"  // $readmemh image
 )(
   input  logic        clk,
   input  logic        reset_n,
@@ -42,7 +43,7 @@ module main_memory #(
   logic [DATA_WIDTH-1:0] mem [0:NUM_WORDS-1];
 
   initial begin
-    $readmemh("machine_code.mem", mem);
+    $readmemh(MEM_INIT_FILE, mem);
   end
 
   // ------------------------------------------------------------------

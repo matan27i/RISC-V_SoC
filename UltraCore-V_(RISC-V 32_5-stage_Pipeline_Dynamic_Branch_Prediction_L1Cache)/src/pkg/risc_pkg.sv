@@ -1,7 +1,7 @@
 // RISC-V RV32I Processor Package
 package risc_pkg;
 
-  parameter XLEN = 32;
+  localparam XLEN = 32;
 
   typedef enum logic [6:0] {
     OPCODE_R_TYPE = 7'b0110011,

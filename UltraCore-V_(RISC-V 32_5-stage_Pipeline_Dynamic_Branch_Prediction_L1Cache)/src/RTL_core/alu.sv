@@ -6,8 +6,7 @@ module alu(
   input  logic [XLEN-1:0] alu_b,    // ALU input B
   input  alu_op_t         alu_op,   // ALU operation from risc_pkg
 
-  output logic [XLEN-1:0] alu_res // ALU output
-
+  output logic [XLEN-1:0] alu_res   // ALU output
 );
 
 // Internal signals for signed arithmetic operations
@@ -20,7 +19,7 @@ assign signed_b = $signed(alu_b);
 // ALU Operation Logic
 always_comb begin
   alu_res = '0; // Default to zero to prevent latches
-  
+
   case (alu_op)
     ADD: alu_res = signed_a + signed_b;
     SUB: alu_res = signed_a - signed_b;
@@ -38,13 +37,9 @@ always_comb begin
     // Comparisons
     SLTU: alu_res = (alu_a < alu_b) ? 32'd1 : '0;         // Unsigned
     SLT:  alu_res = (signed_a < signed_b) ? 32'd1 : '0;   // Signed
-    
+
     default: alu_res = '0;
   endcase
-end 
-
-// Generate Zero flag
-// High when the result is 0 (Used primarily for BEQ/BNE branch evaluation)
-assign zero = (alu_res == '0);
+end
 
 endmodule
