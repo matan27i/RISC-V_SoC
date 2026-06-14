@@ -44,9 +44,10 @@
 // own STATUS registers, which is how today's RV32I software uses them.
 
 module soc_top #(
-  parameter int unsigned CLK_FREQ_HZ   = 100_000_000,
-  parameter int unsigned BAUD_RATE     = 115_200,
-  parameter              MEM_INIT_FILE = "machine_code.mem"
+  parameter int unsigned CLK_FREQ_HZ        = 100_000_000,
+  parameter int unsigned BAUD_RATE          = 115_200,
+  parameter int unsigned BUS_TIMEOUT_CYCLES = 256,  // AXI watchdog budget
+  parameter              MEM_INIT_FILE      = "machine_code.mem"
 )(
   input  logic        clk,
   input  logic        resetn,
@@ -59,7 +60,11 @@ module soc_top #(
   inout  wire  [7:0]  gpio,
 
   // Debug: architectural PC of the fetch stage
-  output logic [31:0] debug_pc
+  output logic [31:0] debug_pc,
+
+  // Debug/status: pulses when the AXI watchdog had to abort a hung
+  // peripheral access with SLVERR. Leave unconnected if not needed.
+  output logic        bus_timeout
 );
 
   // ----------------------------------------------------------------
@@ -75,7 +80,18 @@ module soc_top #(
   logic        irq_timer_w, irq_ecc_w;
 
   // ----------------------------------------------------------------
-  // Bridge <-> crossbar AXI nets
+  // Bridge -> watchdog AXI nets (br_*)
+  // ----------------------------------------------------------------
+  logic [31:0] br_awaddr, br_wdata, br_araddr, br_rdata;
+  logic [2:0]  br_awprot, br_arprot;
+  logic [3:0]  br_wstrb;
+  logic [1:0]  br_bresp, br_rresp;
+  logic        br_awvalid, br_awready, br_wvalid, br_wready;
+  logic        br_bvalid, br_bready, br_arvalid, br_arready;
+  logic        br_rvalid, br_rready;
+
+  // ----------------------------------------------------------------
+  // Watchdog -> crossbar AXI nets (xb_*)
   // ----------------------------------------------------------------
   logic [31:0] xb_awaddr, xb_wdata, xb_araddr, xb_rdata;
   logic [2:0]  xb_awprot, xb_arprot;
@@ -84,6 +100,9 @@ module soc_top #(
   logic        xb_awvalid, xb_awready, xb_wvalid, xb_wready;
   logic        xb_bvalid, xb_bready, xb_arvalid, xb_arready;
   logic        xb_rvalid, xb_rready;
+
+  logic        wdog_wr_evt, wdog_rd_evt;
+  assign bus_timeout = wdog_wr_evt | wdog_rd_evt;
 
   // Crossbar -> slave nets (per slave)
   logic [31:0] rom_awaddr, rom_wdata, rom_araddr, rom_rdata;
@@ -175,25 +194,83 @@ module soc_top #(
     .mmio_rd_data     (mmio_rd_data),
     .mmio_ready       (mmio_ready),
     .mmio_accept      (mmio_accept),
-    .m_axi_awaddr     (xb_awaddr),
-    .m_axi_awprot     (xb_awprot),
-    .m_axi_awvalid    (xb_awvalid),
-    .m_axi_awready    (xb_awready),
-    .m_axi_wdata      (xb_wdata),
-    .m_axi_wstrb      (xb_wstrb),
-    .m_axi_wvalid     (xb_wvalid),
-    .m_axi_wready     (xb_wready),
-    .m_axi_bresp      (xb_bresp),
-    .m_axi_bvalid     (xb_bvalid),
-    .m_axi_bready     (xb_bready),
-    .m_axi_araddr     (xb_araddr),
-    .m_axi_arprot     (xb_arprot),
-    .m_axi_arvalid    (xb_arvalid),
-    .m_axi_arready    (xb_arready),
-    .m_axi_rdata      (xb_rdata),
-    .m_axi_rresp      (xb_rresp),
-    .m_axi_rvalid     (xb_rvalid),
-    .m_axi_rready     (xb_rready)
+    .m_axi_awaddr     (br_awaddr),
+    .m_axi_awprot     (br_awprot),
+    .m_axi_awvalid    (br_awvalid),
+    .m_axi_awready    (br_awready),
+    .m_axi_wdata      (br_wdata),
+    .m_axi_wstrb      (br_wstrb),
+    .m_axi_wvalid     (br_wvalid),
+    .m_axi_wready     (br_wready),
+    .m_axi_bresp      (br_bresp),
+    .m_axi_bvalid     (br_bvalid),
+    .m_axi_bready     (br_bready),
+    .m_axi_araddr     (br_araddr),
+    .m_axi_arprot     (br_arprot),
+    .m_axi_arvalid    (br_arvalid),
+    .m_axi_arready    (br_arready),
+    .m_axi_rdata      (br_rdata),
+    .m_axi_rresp      (br_rresp),
+    .m_axi_rvalid     (br_rvalid),
+    .m_axi_rready     (br_rready)
+  );
+
+  // ----------------------------------------------------------------
+  // AXI4-Lite timeout monitor (watchdog) on the master->interconnect
+  // link. Transparent when peripherals are healthy; if any slave hangs
+  // it closes the handshake and injects SLVERR so the CPU's MMIO stall
+  // is released instead of locking the pipeline forever.
+  // ----------------------------------------------------------------
+  axi4lite_timeout_monitor #(
+    .ADDR_WIDTH     (32),
+    .DATA_WIDTH     (32),
+    .TIMEOUT_CYCLES (BUS_TIMEOUT_CYCLES)
+  ) u_bus_wdog (
+    .clk            (clk),
+    .resetn         (resetn),
+    // Upstream (faces the master bridge)
+    .s_axi_awaddr   (br_awaddr),
+    .s_axi_awprot   (br_awprot),
+    .s_axi_awvalid  (br_awvalid),
+    .s_axi_awready  (br_awready),
+    .s_axi_wdata    (br_wdata),
+    .s_axi_wstrb    (br_wstrb),
+    .s_axi_wvalid   (br_wvalid),
+    .s_axi_wready   (br_wready),
+    .s_axi_bresp    (br_bresp),
+    .s_axi_bvalid   (br_bvalid),
+    .s_axi_bready   (br_bready),
+    .s_axi_araddr   (br_araddr),
+    .s_axi_arprot   (br_arprot),
+    .s_axi_arvalid  (br_arvalid),
+    .s_axi_arready  (br_arready),
+    .s_axi_rdata    (br_rdata),
+    .s_axi_rresp    (br_rresp),
+    .s_axi_rvalid   (br_rvalid),
+    .s_axi_rready   (br_rready),
+    // Downstream (faces the crossbar)
+    .m_axi_awaddr   (xb_awaddr),
+    .m_axi_awprot   (xb_awprot),
+    .m_axi_awvalid  (xb_awvalid),
+    .m_axi_awready  (xb_awready),
+    .m_axi_wdata    (xb_wdata),
+    .m_axi_wstrb    (xb_wstrb),
+    .m_axi_wvalid   (xb_wvalid),
+    .m_axi_wready   (xb_wready),
+    .m_axi_bresp    (xb_bresp),
+    .m_axi_bvalid   (xb_bvalid),
+    .m_axi_bready   (xb_bready),
+    .m_axi_araddr   (xb_araddr),
+    .m_axi_arprot   (xb_arprot),
+    .m_axi_arvalid  (xb_arvalid),
+    .m_axi_arready  (xb_arready),
+    .m_axi_rdata    (xb_rdata),
+    .m_axi_rresp    (xb_rresp),
+    .m_axi_rvalid   (xb_rvalid),
+    .m_axi_rready   (xb_rready),
+    // Status
+    .wr_timeout_evt (wdog_wr_evt),
+    .rd_timeout_evt (wdog_rd_evt)
   );
 
   // ----------------------------------------------------------------

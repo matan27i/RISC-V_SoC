@@ -1,0 +1,20 @@
+// Test application for tb_soc_top - loaded into main RAM (word offset
+// 0x800 = byte address 0x0000_2000, the SoC execution space).
+// Configures GPIO, starts the timer, then polls the ECC accelerator and
+// mirrors the corrected payload onto the GPIO port.
+@00000800
+400002B7  // lui  x5, 0x40000      ; x5 = peripheral base
+0FF00393  // addi x7, x0, 0xFF
+0272AA23  // sw   x7, 0x34(x5)     ; GPIO DIR = all outputs
+0A500393  // addi x7, x0, 0xA5
+0272A823  // sw   x7, 0x30(x5)     ; GPIO DATA = 0xA5
+06400393  // addi x7, x0, 100
+0072AA23  // sw   x7, 0x14(x5)     ; TIMER COMPARE = 100
+00100393  // addi x7, x0, 1
+0072A823  // sw   x7, 0x10(x5)     ; TIMER CTRL.ENABLE = 1
+0242A403  // poll: lw x8, 0x24(x5) ; ECC STATUS
+00147413  // andi x8, x8, 1        ; DATA_READY
+FE040CE3  // beq  x8, x0, poll
+0202A483  // lw   x9, 0x20(x5)     ; ECC corrected payload
+0292A823  // sw   x9, 0x30(x5)     ; GPIO DATA = payload
+0000006F  // park: jal x0, park
