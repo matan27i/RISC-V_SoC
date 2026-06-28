@@ -1,0 +1,25 @@
+// WFI test program. Auto-generated.
+@00000800
+400002B7  // 0x2000: x5=periph base
+00002337  // 0x2004: x6=hi(handler)
+04830313  // 0x2008: x6=handler
+30531073  // 0x200C: mtvec=handler
+08000393  // 0x2010: x7=MTIE
+3043A073  // 0x2014: mie.MTIE=1
+00800393  // 0x2018: x7=MIE
+3003A073  // 0x201C: mstatus.MIE=1
+0FF00393  // 0x2020: x7=0xFF
+0272AA23  // 0x2024: GPIO DIR=out
+01100393  // 0x2028: x7=0x11
+0272A823  // 0x202C: GPIO=0x11 (awake marker)
+03200393  // 0x2030: x7=50
+0072AA23  // 0x2034: TIMER COMPARE=50
+00100393  // 0x2038: x7=1
+0072A823  // 0x203C: TIMER CTRL.ENABLE=1
+10500073  // 0x2040: wfi: sleep until interrupt
+FFDFF06F  // 0x2044: jal x0, sleep
+0CC00413  // 0x2048: x8=0xCC
+0282A823  // 0x204C: GPIO=0xCC (woke + vectored)
+00200413  // 0x2050: x8=2 CLEAR
+0082A823  // 0x2054: TIMER CTRL=CLEAR (ack+stop)
+30200073  // 0x2058: mret

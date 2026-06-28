@@ -1,0 +1,16 @@
+// M-extension test program (loaded at 0x2000). Auto-generated.
+@00000800
+400002B7  // 0x2000: x5 = peripheral base
+0FF00393  // 0x2004: x7 = 0xFF
+0272AA23  // 0x2008: GPIO DIR = outputs
+00600513  // 0x200C: x10 = 6
+00700593  // 0x2010: x11 = 7
+02B50633  // 0x2014: x12 = 6*7 = 42
+06400693  // 0x2018: x13 = 100
+00700713  // 0x201C: x14 = 7
+02E6C7B3  // 0x2020: x15 = 100/7 = 14
+02E6E833  // 0x2024: x16 = 100%7 = 2  (back-to-back M op)
+00F604B3  // 0x2028: x9 = 42+14 = 56  (forward mul+div results)
+010484B3  // 0x202C: x9 = 56+2 = 58 = 0x3A
+0292A823  // 0x2030: GPIO DATA = 0x3A
+0000006F  // 0x2034: park

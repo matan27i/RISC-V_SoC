@@ -1,0 +1,24 @@
+// Interrupt test program (loaded at 0x2000). Auto-generated.
+@00000800
+400002B7  // 0x2000: x5 = 0x40000000 (peripheral base)
+00002337  // 0x2004: x6 = hi(handler)
+04430313  // 0x2008: x6 = handler
+30531073  // 0x200C: mtvec = handler
+08000393  // 0x2010: x7 = 0x80 (MTIE)
+3043A073  // 0x2014: mie.MTIE = 1
+00800393  // 0x2018: x7 = 0x8 (MIE)
+3003A073  // 0x201C: mstatus.MIE = 1
+0FF00393  // 0x2020: x7 = 0xFF
+0272AA23  // 0x2024: GPIO DIR = outputs
+01100393  // 0x2028: x7 = 0x11
+0272A823  // 0x202C: GPIO DATA = 0x11 (pre-int marker)
+03200393  // 0x2030: x7 = 50
+0072AA23  // 0x2034: TIMER COMPARE = 50
+00100393  // 0x2038: x7 = 1
+0072A823  // 0x203C: TIMER CTRL.ENABLE = 1
+0000006F  // 0x2040: spin: jal x0, loop
+0CC00413  // 0x2044: x8 = 0xCC
+0282A823  // 0x2048: GPIO DATA = 0xCC (interrupt marker)
+00200413  // 0x204C: x8 = 2 (CLEAR)
+0082A823  // 0x2050: TIMER CTRL = CLEAR (ack + stop)
+30200073  // 0x2054: mret -> return to loop
